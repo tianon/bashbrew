@@ -153,6 +153,55 @@ func gitNormalizeForTagUsage(text string) string {
 	return gitMultipleSlashes.ReplaceAllString(gitBadTagChars.ReplaceAllString(text, "-"), "/")
 }
 
+var gitLfsProcessed = map[string]bool{}
+
+func ensureGitLfsFetched(repo, commit, dir string) error {
+	cacheKey := commit + ":" + dir
+	if ok := gitLfsProcessed[cacheKey]; ok {
+		return nil
+	}
+	gitLfsProcessed[cacheKey] = true
+
+	if repo == "https://github.com/amazonlinux/container-images.git" {
+		// amazonlinux uses LFS, but not really -- ignore them for now until we can solve the "too many open files" problem
+		return nil
+	}
+
+	// shelling out to "git lfs ..." is pretty expensive, so let's first walk through ".gitattributes" files for any clues that we actually need to
+	for {
+		if dir == "." {
+			dir = ""
+		}
+		attr, err := gitShow(commit, path.Join(dir, ".gitattributes"))
+		if err == nil && strings.Contains(attr, "filter=lfs") {
+			break
+		}
+		if dir == "" {
+			return nil
+		}
+		dir = path.Dir(dir)
+	}
+
+	byteList, err := git("lfs", "ls-files", "--long", "--size", commit)
+	if err != nil {
+		// ideally we would ignore failures here because we probably don't have "git-lfs" installed and we don't have a clean way to detect the need for LFS otherwise (so hopefully the build will fail in some semi-obvious way), but given the size of our cache "repo", the LFS client has a tendancy to error out with "too many open files" so we need to bail instead (https://github.com/docker-library/official-images/issues/1095#issuecomment-521787982)
+		return err
+	}
+
+	list := strings.TrimSpace(string(byteList))
+	if len(list) == 0 {
+		// yay, nothing to fetch!
+		return nil
+	}
+
+	if debugFlag {
+		fmt.Printf("Fetching LFS files (%q -> %q):\n%s\n", repo, commit, list)
+	}
+
+	_, err = git("lfs", "fetch", repo, commit)
+	return err
+}
+
 var gitRepoCache = map[string]string{}
 
 func (r Repo) fetchGitRepo(arch string, entry *manifest.Manifest2822Entry) (string, error) {
@@ -163,7 +212,7 @@ func (r Repo) fetchGitRepo(arch string, entry *manifest.Manifest2822Entry) (stri
 	}, "\n")
 	if commit, ok := gitRepoCache[cacheKey]; ok {
 		entry.SetGitCommit(arch, commit)
-		return commit, nil
+		return commit, ensureGitLfsFetched(entry.ArchGitRepo(arch), commit, entry.ArchDirectory(arch))
 	}
 
 	err := ensureGitInit()
@@ -176,7 +225,7 @@ func (r Repo) fetchGitRepo(arch string, entry *manifest.Manifest2822Entry) (stri
 		if err == nil {
 			gitRepoCache[cacheKey] = commit
 			entry.SetGitCommit(arch, commit)
-			return commit, nil
+			return commit, ensureGitLfsFetched(entry.ArchGitRepo(arch), commit, entry.ArchDirectory(arch))
 		}
 	}
 
@@ -190,7 +239,7 @@ func (r Repo) fetchGitRepo(arch string, entry *manifest.Manifest2822Entry) (stri
 		if err == nil {
 			gitRepoCache[cacheKey] = commit
 			entry.SetGitCommit(arch, commit)
-			return commit, nil
+			return commit, ensureGitLfsFetched(entry.ArchGitRepo(arch), commit, entry.ArchDirectory(arch))
 		}
 		fetchStrings[0] += localRef
 	} else {
@@ -277,5 +326,5 @@ func (r Repo) fetchGitRepo(arch string, entry *manifest.Manifest2822Entry) (stri
 
 	gitRepoCache[cacheKey] = commit
 	entry.SetGitCommit(arch, commit)
-	return commit, nil
+	return commit, ensureGitLfsFetched(entry.ArchGitRepo(arch), commit, entry.ArchDirectory(arch))
 }
