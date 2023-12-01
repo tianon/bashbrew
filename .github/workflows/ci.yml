@@ -19,7 +19,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v3
-      - uses: ./ # test our "action.yml" 👀
+      - uses: ./ # test our "action.yml" 👀 # TODO this is useful and good, but if we're possibly downloading too, we need to *also* test that behavior, separately (because we still need to do a proper force-build test)
       - name: Smoke Test
         run: |
           image='https://github.com/docker-library/official-images/raw/master/library/hello-world'
