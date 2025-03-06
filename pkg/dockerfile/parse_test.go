@@ -63,16 +63,17 @@ func TestParse(t *testing.T) {
 				COPY --from=bar / /
 				COPY --from=foo2 / /
 				COPY --chown=1234:5678 /foo /bar
+				COPY --from=hello-world /hello /usr/local/bin/
 			`,
 			metadata: dockerfile.Metadata{
-				StageFroms: []string{"bash:latest", "busybox:uclibc", "bash:5", "bash:latest", "scratch"},
-				StageNames: []string{"foo", "bar", "foo2"},
-				StageNameFroms: map[string]string{
-					"foo":  "bash:latest",
-					"bar":  "bash:5",
-					"foo2": "bash:latest",
+				Stages: []dockerfile.Stage{
+					{From: "bash:latest", Name: "foo"},
+					{From: "busybox:uclibc"},
+					{From: "bash:5", Name: "bar"},
+					{From: "bash:latest", FromStage: "foo", Name: "foo2"},
+					{From: "scratch"},
 				},
-				Froms: []string{"bash:latest", "busybox:uclibc", "bash:5", "bash:latest", "scratch", "bash:latest", "bash:5", "bash:latest"},
+				Froms: []string{"bash:latest", "busybox:uclibc", "bash:5", "bash:latest", "scratch", "bash:latest", "bash:5", "bash:latest", "hello-world:latest"},
 			},
 		},
 		{
@@ -127,8 +128,13 @@ func TestParse(t *testing.T) {
 				RUN --mount=type=bind,from=2 cat /foo
 			`,
 			metadata: dockerfile.Metadata{
-				StageFroms: []string{"bash:latest", "scratch", "scratch", "bash:latest"},
-				Froms:      []string{"bash:latest", "scratch", "bash:latest", "scratch", "scratch", "bash:latest", "scratch"},
+				Stages: []dockerfile.Stage{
+					{From: "bash:latest"},
+					{From: "scratch"},
+					{From: "scratch"},
+					{From: "bash:latest"},
+				},
+				Froms: []string{"bash:latest", "scratch", "bash:latest", "scratch", "scratch", "bash:latest", "scratch"},
 			},
 		},
 		{
@@ -138,8 +144,8 @@ func TestParse(t *testing.T) {
 				RUN --mount=type=bind,from=busybox:uclibc,target=/tmp ["/tmp/bin/sh","-euxc","echo foo > /foo"]
 			`,
 			metadata: dockerfile.Metadata{
-				StageFroms: []string{"scratch"},
-				Froms:      []string{"scratch", "busybox:uclibc"},
+				Stages: []dockerfile.Stage{{From: "scratch"}},
+				Froms:  []string{"scratch", "busybox:uclibc"},
 			},
 		},
 		{
@@ -152,10 +158,27 @@ func TestParse(t *testing.T) {
 				RUN --mount=type=bind,from=bb,target=/tmp ["/tmp/bin/sh","-euxc","echo foo > /foo"]
 			`,
 			metadata: dockerfile.Metadata{
-				StageFroms:     []string{"busybox:uclibc", "scratch"},
-				StageNames:     []string{"bb"},
-				StageNameFroms: map[string]string{"bb": "busybox:uclibc"},
-				Froms:          []string{"busybox:uclibc", "scratch", "busybox:uclibc"},
+				Stages: []dockerfile.Stage{
+					{From: "busybox:uclibc", Name: "bb"},
+					{From: "scratch"},
+				},
+				Froms: []string{"busybox:uclibc", "scratch", "busybox:uclibc"},
+			},
+		},
+		{
+			name: "FROM --platform",
+			dockerfile: `
+				FROM --platform=$BUILDPLATFORM golang AS build
+				RUN do some stuff
+				FROM --platform=$TARGETPLATFORM debian
+				COPY --from=build /some/binary /some/other/place
+			`,
+			metadata: dockerfile.Metadata{
+				Stages: []dockerfile.Stage{
+					{From: "golang:latest", Name: "build", Platform: "$BUILDPLATFORM"},
+					{From: "debian:latest", Platform: "$TARGETPLATFORM"},
+				},
+				Froms: []string{"golang:latest", "debian:latest", "golang:latest"},
 			},
 		},
 	} {
@@ -163,11 +186,19 @@ func TestParse(t *testing.T) {
 		if td.name == "" {
 			td.name = td.dockerfile
 		}
-		if len(td.metadata.Froms) > 0 && len(td.metadata.StageFroms) == 0 {
-			td.metadata.StageFroms = td.metadata.Froms
+		if len(td.metadata.Froms) > 0 && len(td.metadata.Stages) == 0 {
+			td.metadata.Stages = make([]dockerfile.Stage, len(td.metadata.Froms))
+			for i, from := range td.metadata.Froms {
+				td.metadata.Stages[i].From = from
+			}
 		}
-		if td.metadata.StageNameFroms == nil {
-			td.metadata.StageNameFroms = map[string]string{}
+		if td.metadata.NamedStages == nil {
+			td.metadata.NamedStages = map[string]int{}
+			for i, stage := range td.metadata.Stages {
+				if stage.Name != "" {
+					td.metadata.NamedStages[stage.Name] = i
+				}
+			}
 		}
 		t.Run(td.name, func(t *testing.T) {
 			parsed, err := dockerfile.Parse(td.dockerfile)

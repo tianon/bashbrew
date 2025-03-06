@@ -23,7 +23,7 @@ func (r Repo) ArchLastStageFrom(arch string, entry *manifest.Manifest2822Entry) 
 	if err != nil {
 		return "", err
 	}
-	return dockerfileMeta.StageFroms[len(dockerfileMeta.StageFroms)-1], nil
+	return dockerfileMeta.Stages[len(dockerfileMeta.Stages)-1].From, nil
 }
 
 func (r Repo) DockerFroms(entry *manifest.Manifest2822Entry) ([]string, error) {

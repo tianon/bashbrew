@@ -2,16 +2,24 @@ package dockerfile
 
 import (
 	"bufio"
+	"fmt"
 	"io"
 	"strconv"
 	"strings"
 	"unicode"
 )
 
+type Stage struct {
+	From      string // image name (or parent stage's image name, if "FROM stage-name")
+	FromStage string // original stage name, if "FROM stage-name"
+	Name      string // empty for unnamed stages
+	Platform  string // empty string, $BUILDPLATFORM, or $TARGETPLATFORM
+	// TODO somehow, we need to expose the platform of each stage to meta-scripts so it can know that, for example, the build stage base image is only needed for the *host* platform, not the target platform
+}
+
 type Metadata struct {
-	StageFroms     []string          // every image "FROM" instruction value (or the parent stage's FROM value in the case of a named stage)
-	StageNames     []string          // the name of any named stage (in order)
-	StageNameFroms map[string]string // map of stage names to FROM values (or the parent stage's FROM value in the case of a named stage), useful for resolving stage names to FROM values
+	Stages      []Stage
+	NamedStages map[string]int // map of stage names to index in Stages slice
 
 	Froms []string // every "FROM" or "COPY --from=xxx" value (minus named and/or numbered stages in the case of "--from=")
 }
@@ -23,7 +31,7 @@ func Parse(dockerfile string) (Metadata, error) {
 func ParseReader(dockerfile io.Reader) (Metadata, error) {
 	meta := Metadata{
 		// panic: assignment to entry in nil map
-		StageNameFroms: map[string]string{},
+		NamedStages: map[string]int{},
 		// (nil slices work fine)
 	}
 
@@ -77,76 +85,100 @@ func ParseReader(dockerfile io.Reader) (Metadata, error) {
 
 		instruction := strings.ToUpper(fields[0])
 
-		// TODO balk at ARG / $ in from values
+		args := fields[1:]
 
 		switch instruction {
 		case "FROM":
-			from := fields[1]
+			var stage Stage
+			if platform, ok := strings.CutPrefix(args[0], "--platform="); ok {
+				stage.Platform = platform
+				args = args[1:]
+				switch stage.Platform {
+				case "$BUILDPLATFORM", "$TARGETPLATFORM":
+					// explicitly allowed for more efficient cross-compiling (see also condition outside the meta loop to ensure the final stage is either without platform or explicitly --platform=$TARGETPLATFORM)
+				default:
+					return meta, fmt.Errorf("FROM has unsupported --platform=%q -- any --platform must be generic or unspecified for correct dependency calculation", stage.Platform)
+				}
+			}
 
-			if stageFrom, ok := meta.StageNameFroms[from]; ok {
+			stage.From = args[0]
+			args = args[1:]
+
+			if strings.ContainsRune(stage.From, '$') {
+				return meta, fmt.Errorf("FROM %q contains invalid/disallowed character '$' -- explicit FROM values are required for dependency calculation", stage.From)
+			}
+
+			if i, ok := meta.NamedStages[stage.From]; ok {
 				// if this is a valid stage name, we should resolve it back to the original FROM value of that previous stage (we don't care about inter-stage dependencies for the purposes of either tag dependency calculation or tag building -- just how many there are and what external things they require)
-				from = stageFrom
+				parent := meta.Stages[i]
+				if stage.Platform == "" {
+					stage.Platform = parent.Platform
+				} else if stage.Platform != parent.Platform {
+					return meta, fmt.Errorf("FROM %q has --platform=%q but stage %q has --platform=%q", stage.From, stage.Platform, stage.From, parent.Platform)
+				}
+				stage.FromStage = stage.From
+				stage.From = parent.From
+			} else {
+				// make sure to add ":latest" if it's implied
+				stage.From = latestizeRepoTag(stage.From)
 			}
 
-			// make sure to add ":latest" if it's implied
-			from = latestizeRepoTag(from)
-
-			meta.StageFroms = append(meta.StageFroms, from)
-			meta.Froms = append(meta.Froms, from)
-
-			if len(fields) == 4 && strings.ToUpper(fields[2]) == "AS" {
-				stageName := fields[3]
-				meta.StageNames = append(meta.StageNames, stageName)
-				meta.StageNameFroms[stageName] = from
+			i := len(meta.Stages)
+			if len(args) == 2 && strings.ToUpper(args[0]) == "AS" {
+				stage.Name = args[1]
+				meta.NamedStages[stage.Name] = i
 			}
+			meta.Stages = append(meta.Stages, stage)
+
+			meta.Froms = append(meta.Froms, stage.From)
 
 		case "COPY":
-			for _, arg := range fields[1:] {
+			for _, arg := range args {
 				if !strings.HasPrefix(arg, "--") {
 					// doesn't appear to be a "flag"; time to bail!
 					break
 				}
-				if !strings.HasPrefix(arg, "--from=") {
+				from, ok := strings.CutPrefix(arg, "--from=")
+				if !ok {
 					// ignore any flags we're not interested in
 					continue
 				}
-				from := arg[len("--from="):]
 
-				if stageFrom, ok := meta.StageNameFroms[from]; ok {
+				if i, ok := meta.NamedStages[from]; ok {
 					// see note above regarding stage names in FROM
-					from = stageFrom
-				} else if stageNumber, err := strconv.Atoi(from); err == nil && stageNumber < len(meta.StageFroms) {
+					from = meta.Stages[i].From
+				} else if stageNumber, err := strconv.Atoi(from); err == nil && stageNumber < len(meta.Stages) {
 					// must be a stage number, we should resolve it too
-					from = meta.StageFroms[stageNumber]
+					from = meta.Stages[stageNumber].From
+				} else {
+					// make sure to add ":latest" if it's implied
+					from = latestizeRepoTag(from)
 				}
-
-				// make sure to add ":latest" if it's implied
-				from = latestizeRepoTag(from)
 
 				meta.Froms = append(meta.Froms, from)
 			}
 
 		case "RUN": // TODO combine this and the above COPY-parsing code somehow sanely
-			for _, arg := range fields[1:] {
+			for _, arg := range args {
 				if !strings.HasPrefix(arg, "--") {
 					// doesn't appear to be a "flag"; time to bail!
 					break
 				}
-				if !strings.HasPrefix(arg, "--mount=") {
+				csv, ok := strings.CutPrefix(arg, "--mount=")
+				if !ok {
 					// ignore any flags we're not interested in
 					continue
 				}
-				csv := arg[len("--mount="):]
 				// TODO more correct CSV parsing
 				fields := strings.Split(csv, ",")
 				var mountType, from string
 				for _, field := range fields {
-					if strings.HasPrefix(field, "type=") {
-						mountType = field[len("type="):]
+					if val, ok := strings.CutPrefix(field, "type="); ok {
+						mountType = val
 						continue
 					}
-					if strings.HasPrefix(field, "from=") {
-						from = field[len("from="):]
+					if val, ok := strings.CutPrefix(field, "from="); ok {
+						from = val
 						continue
 					}
 				}
@@ -155,21 +187,33 @@ func ParseReader(dockerfile io.Reader) (Metadata, error) {
 					continue
 				}
 
-				if stageFrom, ok := meta.StageNameFroms[from]; ok {
+				if i, ok := meta.NamedStages[from]; ok {
 					// see note above regarding stage names in FROM
-					from = stageFrom
-				} else if stageNumber, err := strconv.Atoi(from); err == nil && stageNumber < len(meta.StageFroms) {
+					from = meta.Stages[i].From
+				} else if stageNumber, err := strconv.Atoi(from); err == nil && stageNumber < len(meta.Stages) {
 					// must be a stage number, we should resolve it too
-					from = meta.StageFroms[stageNumber]
+					from = meta.Stages[stageNumber].From
+				} else {
+					// make sure to add ":latest" if it's implied
+					from = latestizeRepoTag(from)
 				}
-
-				// make sure to add ":latest" if it's implied
-				from = latestizeRepoTag(from)
 
 				meta.Froms = append(meta.Froms, from)
 			}
 		}
 	}
+
+	// TODO maybe we *shouldn't* support parsing a fully empty Dockerfile? 🤔 (we actively use an "empty" Dockerfile in the tests to test edge cases of continuation though that are otherwise hard to test, so it's probably ~fine)
+	if len(meta.Stages) > 0 {
+		finalStage := meta.Stages[len(meta.Stages)-1]
+		switch finalStage.Platform {
+		case "", "$TARGETPLATFORM":
+			// yay, all is well
+		default:
+			return meta, fmt.Errorf("final stage/FROM (%q) has --platform=%q but must be unspecified or $TARGETPLATFORM", finalStage.From, finalStage.Platform)
+		}
+	}
+
 	return meta, scanner.Err()
 }
 
